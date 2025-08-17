@@ -1,0 +1,71 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+model User {
+  id               String          @id @default(uuid())
+  username         String          @unique
+  email            String          @unique
+  passwordHash     String
+  identityPubkey   String
+  createdAt        DateTime        @default(now())
+  updatedAt        DateTime        @updatedAt
+  receivedMessages Message[]       @relation("ReceivedMessages")
+  sentMessages     Message[]       @relation("SentMessages")
+  oneTimePrekeys   OneTimePrekey[]
+  prekeys          Prekey?
+
+  @@map("users")
+}
+
+model Prekey {
+  id              String   @id @default(uuid())
+  userId          String   @unique
+  signedPrekey    String
+  prekeySignature String
+  keyId           Int
+  createdAt       DateTime @default(now())
+  user            User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@map("prekeys")
+}
+
+model OneTimePrekey {
+  id        String   @id @default(uuid())
+  userId    String
+  pubkey    String
+  keyId     Int
+  createdAt DateTime @default(now())
+  user      User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@unique([userId, keyId])
+  @@map("one_time_prekeys")
+}
+
+model Message {
+  id           String      @id @default(uuid())
+  senderId     String
+  recipientId  String
+  ciphertext   String
+  messageType  MessageType @default(REGULAR)
+  delivered    Boolean     @default(false)
+  acknowledged Boolean     @default(false)
+  createdAt    DateTime    @default(now())
+  recipient    User        @relation("ReceivedMessages", fields: [recipientId], references: [id], onDelete: Cascade)
+  sender       User        @relation("SentMessages", fields: [senderId], references: [id], onDelete: Cascade)
+
+  @@index([recipientId, delivered])
+  @@index([senderId, createdAt])
+  @@map("messages")
+}
+
+enum MessageType {
+  REGULAR
+  KEY_EXCHANGE
+  PREKEY_REQUEST
+}
