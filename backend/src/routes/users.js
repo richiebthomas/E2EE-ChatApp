@@ -92,6 +92,51 @@ router.post('/identity/rotate',
   }
 );
 
+// Store client-side encrypted key backup blob
+router.post('/keys/backup',
+  body('backup').isString().notEmpty().withMessage('Invalid backup blob'),
+  body('salt').optional().isString().withMessage('Invalid backup salt'),
+  async (req, res) => {
+    try {
+      const errors = validationResult(req);
+      if (!errors.isEmpty()) {
+        return res.status(400).json({ error: 'Validation failed', details: errors.array() });
+      }
+
+      const userId = req.user.id;
+      const { backup, salt } = req.body;
+
+      await prisma.user.update({
+        where: { id: userId },
+        data: { keyBackup: backup, keyBackupSalt: salt }
+      });
+
+      res.json({ message: 'Backup stored' });
+    } catch (error) {
+      console.error('Key backup error:', error);
+      res.status(500).json({ error: 'Failed to store backup' });
+    }
+  }
+);
+
+// Retrieve key backup blob
+router.get('/keys/backup', async (req, res) => {
+  try {
+    const userId = req.user.id;
+    const user = await prisma.user.findUnique({
+      where: { id: userId },
+      select: { keyBackup: true, keyBackupSalt: true }
+    });
+    if (!user || !user.keyBackup) {
+      return res.status(404).json({ error: 'No backup found' });
+    }
+    res.json({ backup: user.keyBackup, salt: user.keyBackupSalt });
+  } catch (error) {
+    console.error('Key backup fetch error:', error);
+    res.status(500).json({ error: 'Failed to fetch backup' });
+  }
+});
+
 // Search users (for finding people to chat with)
 router.get('/search', validateUserSearch, async (req, res) => {
   try {
@@ -232,7 +277,7 @@ router.get('/conversations/recent', async (req, res) => {
         "senderId",
         "recipientId",
         ciphertext,
-        "messageType",
+        ("messageType"::text) AS "messageType",
         "createdAt",
         delivered,
         acknowledged

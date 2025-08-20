@@ -258,6 +258,29 @@ class ApiService {
     return User.fromJson(data['user']);
   }
 
+  // Keys backup APIs
+  Future<void> uploadKeyBackup({
+    required String backup,
+    required String salt,
+  }) async {
+    final response = await http.post(
+      Uri.parse('$baseUrl/users/keys/backup'),
+      headers: _headers,
+      body: json.encode({ 'backup': backup, 'salt': salt }),
+    );
+    _handleResponse(response);
+  }
+
+  Future<Map<String, String>?> getKeyBackup() async {
+    final response = await http.get(
+      Uri.parse('$baseUrl/users/keys/backup'),
+      headers: _headers,
+    );
+    if (response.statusCode == 404) return null;
+    final data = _handleResponse(response);
+    return { 'backup': data['backup'] as String, 'salt': data['salt'] as String? ?? '' };
+  }
+
   // Rotate identity public key and clear prekeys server-side
   Future<void> rotateIdentity(String identityPubkey) async {
     final response = await http.post(

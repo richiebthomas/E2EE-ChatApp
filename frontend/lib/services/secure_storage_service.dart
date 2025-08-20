@@ -186,6 +186,19 @@ class SecureStorageService {
     return await _storage.readAll();
   }
 
+  // Export/import all local Signal state as a JSON blob
+  Future<String> exportAllSensitiveData() async {
+    final all = await _storage.readAll();
+    return json.encode(all);
+  }
+
+  Future<void> importAllSensitiveData(String blobJson) async {
+    final map = (json.decode(blobJson) as Map).cast<String, String>();
+    for (final entry in map.entries) {
+      await _storage.write(key: entry.key, value: entry.value);
+    }
+  }
+
   Future<bool> hasIdentityKeys() async {
     final keys = await getIdentityKeyPair();
     return keys != null;

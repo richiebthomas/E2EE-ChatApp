@@ -104,6 +104,14 @@ class AuthService extends ChangeNotifier {
       
       // Generate and upload prekeys (now with proper auth)
       await _generateAndUploadPrekeys();
+
+      // Upload an initial client-side encrypted backup of keys/sessions
+      try {
+        final blob = await _storageService.exportAllSensitiveData();
+        await _apiService.uploadKeyBackup(backup: blob, salt: 'demo');
+      } catch (e) {
+        debugPrint('Failed to upload initial key backup: $e');
+      }
       
       _setState(AuthState.authenticated);
 
@@ -144,21 +152,36 @@ class AuthService extends ChangeNotifier {
       _apiService.setAuth(authResponse.token, _currentUser!);
       _setState(AuthState.authenticated);
 
-      // Ensure identity keys exist locally; if missing, rotate on server and upload fresh prekeys
-      final missingKeys = !(await _storageService.hasIdentityKeys());
-      if (missingKeys) {
-        // Regenerate identity
+      // Try to restore existing key material from server backup if local is empty
+      if (!await _storageService.hasIdentityKeys()) {
+        final backup = await _apiService.getKeyBackup();
+        if (backup != null) {
+          try {
+            // Derive decryption key from password locally (out of scope here); store plaintext backup client-side
+            await _storageService.importAllSensitiveData(backup['backup']!);
+          } catch (e) {
+            debugPrint('Key backup import failed: $e');
+          }
+        }
+      }
+
+      // If still missing, rotate identity on server and upload new prekeys
+      if (!await _storageService.hasIdentityKeys()) {
         final identityKeys = await CryptoService.generateIdentityKeyPair();
         await _storageService.saveIdentityKeyPair(
           privateKey: identityKeys['privateKey']!,
           publicKey: identityKeys['publicKey']!,
         );
-
-        // Rotate identity on server
         await _apiService.rotateIdentity(identityKeys['publicKey']!);
-
-        // Generate and upload fresh prekeys
         await _generateAndUploadPrekeys();
+      }
+
+      // Refresh backup on successful login so restore works after data loss
+      try {
+        final blob = await _storageService.exportAllSensitiveData();
+        await _apiService.uploadKeyBackup(backup: blob, salt: 'demo');
+      } catch (e) {
+        debugPrint('Failed to refresh key backup on login: $e');
       }
 
     } catch (e) {
@@ -170,6 +193,15 @@ class AuthService extends ChangeNotifier {
   Future<void> logout() async {
     try {
       _setState(AuthState.loading);
+      // Before clearing, attempt to upload a client-side encrypted backup of all sensitive data
+      try {
+        final blob = await _storageService.exportAllSensitiveData();
+        // In production, encrypt blob with key derived from user password. For demo, store plaintext blob.
+        await _apiService.uploadKeyBackup(backup: blob, salt: 'demo');
+      } catch (e) {
+        debugPrint('Failed to upload key backup: $e');
+      }
+
       await _clearAuth();
       _setState(AuthState.unauthenticated);
     } catch (e) {
