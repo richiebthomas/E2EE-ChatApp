@@ -25,6 +25,7 @@ class SignalProtocol {
     required String signedPrekey,
     required String signature,
     String? oneTimePrekey,
+    int? oneTimePrekeyId,
   }) async {
     try {
       print('🔑 Starting Signal session with: $otherUserId');
@@ -47,12 +48,13 @@ class SignalProtocol {
         ourKeys: ourKeys,
         theirSignedPrekey: signedPrekey,
         isInitiator: true,
+        usedOneTimePrekeyId: oneTimePrekeyId,
       );
       
       _sessions[otherUserId] = session;
       await _saveSession(session);
       
-      print('✅ Session created successfully');
+      print('✅ Session created successfully (initiator) user=$otherUserId sess=${session.sessionId.substring(0,8)} otp=${oneTimePrekeyId ?? -1}');
       return session;
       
     } catch (e) {
@@ -61,11 +63,12 @@ class SignalProtocol {
     }
   }
 
-  /// Start session from incoming message
+  /// Start session from incoming message (receiver side)
   Future<SignalSession> startSessionFromIncoming({
     required String otherUserId,
     required String senderEphemeralKey,
     required String senderIdentityKey,
+    int? oneTimePrekeyId,
   }) async {
     try {
       print('🔑 Starting session from incoming message');
@@ -73,11 +76,12 @@ class SignalProtocol {
       // Get our keys
       final ourKeys = await _getOurKeys();
       
-      // Perform X3DH as receiver
+      // Perform X3DH as receiver (optionally include our one-time prekey if specified)
       final sharedSecret = await _performX3DHReceiver(
         ourKeys: ourKeys,
         theirIdentityKey: senderIdentityKey,
         theirEphemeralKey: senderEphemeralKey,
+        ourOneTimePrekeyId: oneTimePrekeyId,
       );
       
       // Create session
@@ -87,12 +91,13 @@ class SignalProtocol {
         ourKeys: ourKeys,
         theirSignedPrekey: senderEphemeralKey,
         isInitiator: false,
+        usedOneTimePrekeyId: oneTimePrekeyId,
       );
       
       _sessions[otherUserId] = session;
       await _saveSession(session);
       
-      print('✅ Session created from incoming message');
+      print('✅ Session created from incoming message user=$otherUserId sess=${session.sessionId.substring(0,8)} otp=${oneTimePrekeyId ?? -1}');
       return session;
       
     } catch (e) {
@@ -112,27 +117,45 @@ class SignalProtocol {
       // Get current message number
       final messageNumber = session.sendMessageNumber;
       
-      // Derive message key deterministically
-      final messageKey = await _deriveMessageKey(
-        baseKey: session.sendKey,
+      // Build header (used as AAD for AEAD)
+      final header = MessageHeader(
+        senderId: await _getCurrentUserId(),
         messageNumber: messageNumber,
-        userId: session.userId,
-        isOutgoing: true,
+        sessionId: session.sessionId,
+        senderIdentityKey: session.ourIdentityPublic,
+        senderEphemeralKey: session.ourEphemeralPublic,
+        receiverOneTimePrekeyId: session.usedOneTimePrekeyId,
+        isPrekeyMessage: session.isInitiator && messageNumber == 0,
+        version: 'v1',
       );
+      final aadBytes = _aadForHeader(header);
+
+      // Derive direction key from root + senderId, then derive per-message key
+      final directionKey = await _deriveDirectionKey(
+        rootKeyBase64: session.rootKey,
+        sessionId: session.sessionId,
+        senderId: header.senderId,
+      );
+      final messageKey = await _deriveMessageKey(
+        baseKeyBytes: directionKey,
+        messageNumber: messageNumber,
+        sessionId: session.sessionId,
+      );
+      print('🔑 Keys: rootFp=${await _fp(base64Decode(session.rootKey))} dirFp=${await _fp(directionKey)} msg#=$messageNumber aad="${String.fromCharCodes(aadBytes)}"');
       
       // Encrypt the message
-      final encryptedData = await _encryptWithKey(messageKey, plaintext);
+      final encryptedData = await _encryptWithKey(
+        messageKey,
+        plaintext,
+        aad: aadBytes,
+      );
       
       // Create message
       final message = EncryptedMessage(
         ciphertext: encryptedData.ciphertext,
         nonce: encryptedData.nonce,
         authTag: encryptedData.authTag,
-        header: MessageHeader(
-          senderId: await _getCurrentUserId(),
-          messageNumber: messageNumber,
-          sessionId: session.sessionId,
-        ),
+        header: header,
       );
       
       // Increment message counter
@@ -150,55 +173,142 @@ class SignalProtocol {
 
   /// Decrypt a message
   Future<String> decryptMessage(String userId, EncryptedMessage encryptedMessage) async {
-    var session = _sessions[userId];
-    
-    // If no session, try to create one from the message
-    if (session == null) {
-      print('📥 No session found, creating from incoming message');
-      session = await startSessionFromIncoming(
-        otherUserId: userId,
-        senderEphemeralKey: '', // Will be derived from message
-        senderIdentityKey: '', // Will be derived from message
-      );
-    }
-
-    try {
+    Future<String> _attemptDecrypt(SignalSession session) async {
       final messageNumber = encryptedMessage.header.messageNumber;
-      final senderId = encryptedMessage.header.senderId;
-      
-      // Determine if this is our own message
-      final currentUserId = await _getCurrentUserId();
-      final isOwnMessage = senderId == currentUserId;
-      
-      // Derive message key
-      final messageKey = await _deriveMessageKey(
-        baseKey: isOwnMessage ? session.sendKey : session.receiveKey,
-        messageNumber: messageNumber,
-        userId: session.userId,
-        isOutgoing: isOwnMessage,
+      final directionKey = await _deriveDirectionKey(
+        rootKeyBase64: session.rootKey,
+        sessionId: session.sessionId,
+        senderId: encryptedMessage.header.senderId,
       );
-      
-      // Decrypt the message
+      final messageKey = await _deriveMessageKey(
+        baseKeyBytes: directionKey,
+        messageNumber: messageNumber,
+        sessionId: session.sessionId,
+      );
+      // Print keys before decryption so we still get diagnostics on MAC failures
+      print('🧪 Decrypt attempt keys: rootFp=${await _fp(base64Decode(session.rootKey))} dirFp=${await _fp(directionKey)} msg#=$messageNumber aad="${String.fromCharCodes(_aadForHeader(encryptedMessage.header))}"');
       final plaintext = await _decryptWithKey(
         messageKey,
         encryptedMessage.ciphertext,
         encryptedMessage.nonce,
         encryptedMessage.authTag,
+        aad: _aadForHeader(encryptedMessage.header),
       );
-      
+      print('🔑 Decrypt keys: rootFp=${await _fp(base64Decode(session.rootKey))} dirFp=${await _fp(directionKey)} msg#=$messageNumber aad="${String.fromCharCodes(_aadForHeader(encryptedMessage.header))}"');
       // Update receive counter if it's not our own message
+      final currentUserId = await _getCurrentUserId();
+      final isOwnMessage = encryptedMessage.header.senderId == currentUserId;
       if (!isOwnMessage && messageNumber >= session.receiveMessageNumber) {
         session.receiveMessageNumber = messageNumber + 1;
         await _saveSession(session);
       }
-      
-      print('🔓 Message decrypted (msg #$messageNumber, own: $isOwnMessage)');
+      print('🔓 Message decrypted (msg #$messageNumber)');
       return plaintext;
-      
+    }
+
+    var session = _sessions[userId];
+
+    // Determine if this is our own message
+    final currentUserId = await _getCurrentUserId();
+    final isOwnMessage = encryptedMessage.header.senderId == currentUserId;
+
+    // If no session and it's NOT our own message, try to create one from the incoming header
+    if (session == null && !isOwnMessage) {
+      print('📥 No session found, creating from incoming message');
+      session = await startSessionFromIncoming(
+        otherUserId: userId,
+        senderEphemeralKey: encryptedMessage.header.senderEphemeralKey,
+        senderIdentityKey: encryptedMessage.header.senderIdentityKey,
+        oneTimePrekeyId: encryptedMessage.header.receiverOneTimePrekeyId,
+      );
+    }
+
+    if (session == null) {
+      // We cannot reconstruct a session for our own previously sent messages without stored session state
+      throw Exception('Missing session for user $userId');
+    }
+
+    try {
+      return await _attemptDecrypt(session);
     } catch (e) {
+      final errorStr = e.toString();
+      if (!isOwnMessage && (errorStr.contains('SecretBoxAuthenticationError') || errorStr.contains('MAC'))) {
+        print('🔁 MAC failed, rebuilding session from header and retrying...');
+        session = await startSessionFromIncoming(
+          otherUserId: userId,
+          senderEphemeralKey: encryptedMessage.header.senderEphemeralKey,
+          senderIdentityKey: encryptedMessage.header.senderIdentityKey,
+          oneTimePrekeyId: encryptedMessage.header.receiverOneTimePrekeyId,
+        );
+        try {
+          return await _attemptDecrypt(session);
+        } catch (_) {
+          // Compatibility fallback 1: old key schedule (send/receive keys) + canonical AAD
+          try {
+            final messageNumber = encryptedMessage.header.messageNumber;
+            final currentUserId = await _getCurrentUserId();
+            final isOwn = encryptedMessage.header.senderId == currentUserId;
+            final legacyBaseKey = isOwn ? session.sendKey : session.receiveKey;
+            final legacyKey = await _deriveLegacyMessageKey(
+              baseKeyBase64: legacyBaseKey,
+              messageNumber: messageNumber,
+              otherUserId: session.userId,
+              isOutgoing: isOwn,
+            );
+            return await _decryptWithKey(
+              legacyKey,
+              encryptedMessage.ciphertext,
+              encryptedMessage.nonce,
+              encryptedMessage.authTag,
+              aad: _aadForHeader(encryptedMessage.header),
+            );
+          } catch (_) {
+            // Compatibility fallback 2: legacy JSON AAD
+            final messageNumber = encryptedMessage.header.messageNumber;
+            final currentUserId = await _getCurrentUserId();
+            final isOwn = encryptedMessage.header.senderId == currentUserId;
+            final legacyBaseKey = isOwn ? session.sendKey : session.receiveKey;
+            final legacyKey = await _deriveLegacyMessageKey(
+              baseKeyBase64: legacyBaseKey,
+              messageNumber: messageNumber,
+              otherUserId: session.userId,
+              isOutgoing: isOwn,
+            );
+            try {
+              return await _decryptWithKey(
+                legacyKey,
+                encryptedMessage.ciphertext,
+                encryptedMessage.nonce,
+                encryptedMessage.authTag,
+                aad: utf8.encode(jsonEncode(encryptedMessage.header.toJson())),
+              );
+            } catch (_) {
+              // Compatibility fallback 3: no AAD (very old builds)
+              return await _decryptWithKey(
+                legacyKey,
+                encryptedMessage.ciphertext,
+                encryptedMessage.nonce,
+                encryptedMessage.authTag,
+              );
+            }
+          }
+        }
+      }
       print('❌ Failed to decrypt message: $e');
       rethrow;
     }
+  }
+
+  /// Old message-key derivation used in earlier builds
+  Future<String> _deriveLegacyMessageKey({
+    required String baseKeyBase64,
+    required int messageNumber,
+    required String otherUserId,
+    required bool isOutgoing,
+  }) async {
+    final info = 'MessageKey_${otherUserId}_${isOutgoing ? 'out' : 'in'}_$messageNumber';
+    final keyBytes = await _hkdf(base64Decode(baseKeyBase64), info, 32);
+    return base64Encode(keyBytes);
   }
 
   /// Perform X3DH key agreement as initiator
@@ -255,15 +365,17 @@ class SignalProtocol {
       );
       combined.addAll(await dh4.extractBytes());
     }
-
-    return Uint8List.fromList(combined);
+    final combinedBytes = Uint8List.fromList(combined);
+    print('🔧 X3DH initiator: usedOTP=${theirOneTimePrekey != null} combinedFp=${await _fp(combinedBytes)} len=${combinedBytes.length}');
+    return combinedBytes;
   }
 
-  /// Perform X3DH as receiver
+  /// Perform X3DH as receiver (optionally include our one-time prekey by ID)
   Future<Uint8List> _performX3DHReceiver({
     required UserKeys ourKeys,
     required String theirIdentityKey,
     required String theirEphemeralKey,
+    int? ourOneTimePrekeyId,
   }) async {
     final theirIdentityPublic = SimplePublicKey(
       base64Decode(theirIdentityKey),
@@ -296,7 +408,25 @@ class SignalProtocol {
     combined.addAll(await dh2.extractBytes());
     combined.addAll(await dh3.extractBytes());
 
-    return Uint8List.fromList(combined);
+    // Optionally include DH4 using our one-time prekey if provided
+    if (ourOneTimePrekeyId != null) {
+      final otpPrivate = await _storage.getOneTimePrekeyPrivate(ourOneTimePrekeyId);
+      if (otpPrivate != null && otpPrivate.isNotEmpty) {
+        final ourOneTimePrekeyPair = await _x25519.newKeyPairFromSeed(
+          base64Decode(otpPrivate),
+        );
+        final dh4 = await _x25519.sharedSecretKey(
+          keyPair: ourOneTimePrekeyPair,
+          remotePublicKey: theirEphemeralPublic,
+        );
+        combined.addAll(await dh4.extractBytes());
+        // Consume local one-time prekey after use
+        await _storage.deleteOneTimePrekeyPrivate(ourOneTimePrekeyId);
+      }
+    }
+    final combinedBytes = Uint8List.fromList(combined);
+    print('🔧 X3DH receiver: usedOTP=${ourOneTimePrekeyId != null} otpId=${ourOneTimePrekeyId ?? -1} combinedFp=${await _fp(combinedBytes)} len=${combinedBytes.length}');
+    return combinedBytes;
   }
 
   /// Create a session with deterministic key assignment
@@ -306,6 +436,7 @@ class SignalProtocol {
     required UserKeys ourKeys,
     required String theirSignedPrekey,
     required bool isInitiator,
+    int? usedOneTimePrekeyId,
   }) async {
     // Derive root key from shared secret
     final rootKey = await _hkdf(sharedSecret, 'RootKey', 32);
@@ -325,6 +456,10 @@ class SignalProtocol {
     final sendKey = base64Encode(isLowerUserId ? keyA : keyB);
     final receiveKey = base64Encode(isLowerUserId ? keyB : keyA);
     
+    // Extract our public keys for header binding
+    final ourIdentityPublicKey = await ourKeys.identityKeyPair.extractPublicKey() as SimplePublicKey;
+    final ourEphemeralPublicKey = await ourKeys.ephemeralKeyPair.extractPublicKey() as SimplePublicKey;
+
     return SignalSession(
       userId: otherUserId,
       sessionId: sessionId,
@@ -335,28 +470,44 @@ class SignalProtocol {
       receiveMessageNumber: 0,
       theirPublicKey: theirSignedPrekey,
       isInitiator: isInitiator,
+      ourIdentityPublic: base64Encode(ourIdentityPublicKey.bytes),
+      ourEphemeralPublic: base64Encode(ourEphemeralPublicKey.bytes),
+      usedOneTimePrekeyId: usedOneTimePrekeyId,
     );
   }
 
-  /// Derive message key deterministically
-  Future<String> _deriveMessageKey({
-    required String baseKey,
-    required int messageNumber,
-    required String userId,
-    required bool isOutgoing,
+  /// Derive a direction key from the session root key and senderId
+  Future<Uint8List> _deriveDirectionKey({
+    required String rootKeyBase64,
+    required String sessionId,
+    required String senderId,
   }) async {
-    final info = 'MessageKey_${userId}_${isOutgoing ? 'out' : 'in'}_$messageNumber';
-    final keyBytes = await _hkdf(base64Decode(baseKey), info, 32);
+    final info = 'DirKey_${sessionId}_$senderId';
+    return await _hkdf(base64Decode(rootKeyBase64), info, 32);
+  }
+
+  /// Derive message key deterministically (same on both sides)
+  Future<String> _deriveMessageKey({
+    required Uint8List baseKeyBytes,
+    required int messageNumber,
+    required String sessionId,
+  }) async {
+    final info = 'MessageKey_${sessionId}_$messageNumber';
+    final keyBytes = await _hkdf(baseKeyBytes, info, 32);
     return base64Encode(keyBytes);
   }
 
   /// Encrypt with authenticated encryption
-  Future<EncryptionResult> _encryptWithKey(String messageKey, String plaintext) async {
+  Future<EncryptionResult> _encryptWithKey(String messageKey, String plaintext, { List<int>? aad }) async {
     final keyBytes = base64Decode(messageKey);
     final secretKey = SecretKey(keyBytes);
     final plainData = utf8.encode(plaintext);
     
-    final secretBox = await _aes.encrypt(plainData, secretKey: secretKey);
+    final secretBox = await _aes.encrypt(
+      plainData,
+      secretKey: secretKey,
+      aad: aad ?? const <int>[],
+    );
     
     return EncryptionResult(
       ciphertext: base64Encode(secretBox.cipherText),
@@ -366,7 +517,7 @@ class SignalProtocol {
   }
 
   /// Decrypt with authenticated decryption
-  Future<String> _decryptWithKey(String messageKey, String ciphertext, String nonce, String authTag) async {
+  Future<String> _decryptWithKey(String messageKey, String ciphertext, String nonce, String authTag, { List<int>? aad }) async {
     final keyBytes = base64Decode(messageKey);
     final secretKey = SecretKey(keyBytes);
     
@@ -376,7 +527,11 @@ class SignalProtocol {
       mac: Mac(base64Decode(authTag)),
     );
     
-    final decryptedData = await _aes.decrypt(secretBox, secretKey: secretKey);
+    final decryptedData = await _aes.decrypt(
+      secretBox,
+      secretKey: secretKey,
+      aad: aad ?? const <int>[],
+    );
     return utf8.decode(decryptedData);
   }
 
@@ -416,6 +571,17 @@ class SignalProtocol {
     final bytes = utf8.encode(input);
     final digest = crypto.sha256.convert(bytes);
     return base64Encode(digest.bytes);
+  }
+
+  /// Build canonical AAD bytes from header to avoid JSON ordering/whitespace issues
+  List<int> _aadForHeader(MessageHeader header) {
+    final canonical = 'v=${header.version}|sid=${header.sessionId}|s=${header.senderId}|n=${header.messageNumber}|ik=${header.senderIdentityKey}|ek=${header.senderEphemeralKey}|otp=${header.receiverOneTimePrekeyId ?? -1}|p=${header.isPrekeyMessage ? 1 : 0}';
+    return utf8.encode(canonical);
+  }
+
+  Future<String> _fp(Uint8List bytes) async {
+    final digest = crypto.sha256.convert(bytes);
+    return base64Encode(digest.bytes).substring(0, 8);
   }
 
   /// Get our cryptographic keys
@@ -518,6 +684,9 @@ class SignalSession {
   int receiveMessageNumber;
   final String theirPublicKey;
   final bool isInitiator;
+  final String ourIdentityPublic;
+  final String ourEphemeralPublic;
+  final int? usedOneTimePrekeyId;
 
   SignalSession({
     required this.userId,
@@ -529,6 +698,9 @@ class SignalSession {
     required this.receiveMessageNumber,
     required this.theirPublicKey,
     required this.isInitiator,
+    required this.ourIdentityPublic,
+    required this.ourEphemeralPublic,
+    this.usedOneTimePrekeyId,
   });
 
   Map<String, dynamic> toJson() {
@@ -542,6 +714,9 @@ class SignalSession {
       'receiveMessageNumber': receiveMessageNumber,
       'theirPublicKey': theirPublicKey,
       'isInitiator': isInitiator,
+      'ourIdentityPublic': ourIdentityPublic,
+      'ourEphemeralPublic': ourEphemeralPublic,
+      'usedOneTimePrekeyId': usedOneTimePrekeyId,
     };
   }
 
@@ -556,6 +731,9 @@ class SignalSession {
       receiveMessageNumber: (json['receiveMessageNumber'] as num?)?.toInt() ?? 0,
       theirPublicKey: json['theirPublicKey'] as String? ?? '',
       isInitiator: json['isInitiator'] as bool? ?? false,
+      ourIdentityPublic: json['ourIdentityPublic'] as String? ?? '',
+      ourEphemeralPublic: json['ourEphemeralPublic'] as String? ?? '',
+      usedOneTimePrekeyId: (json['usedOneTimePrekeyId'] as num?)?.toInt(),
     );
   }
 }
@@ -598,11 +776,21 @@ class MessageHeader {
   final String senderId;
   final int messageNumber;
   final String sessionId;
+  final String senderIdentityKey;
+  final String senderEphemeralKey;
+  final int? receiverOneTimePrekeyId;
+  final bool isPrekeyMessage;
+  final String version;
 
   MessageHeader({
     required this.senderId,
     required this.messageNumber,
     required this.sessionId,
+    required this.senderIdentityKey,
+    required this.senderEphemeralKey,
+    required this.isPrekeyMessage,
+    required this.version,
+    this.receiverOneTimePrekeyId,
   });
 
   Map<String, dynamic> toJson() {
@@ -610,6 +798,11 @@ class MessageHeader {
       'senderId': senderId,
       'messageNumber': messageNumber,
       'sessionId': sessionId,
+      'senderIdentityKey': senderIdentityKey,
+      'senderEphemeralKey': senderEphemeralKey,
+      'receiverOneTimePrekeyId': receiverOneTimePrekeyId,
+      'isPrekeyMessage': isPrekeyMessage,
+      'version': version,
     };
   }
 
@@ -618,6 +811,11 @@ class MessageHeader {
       senderId: json['senderId'] as String,
       messageNumber: (json['messageNumber'] as num).toInt(),
       sessionId: json['sessionId'] as String,
+      senderIdentityKey: json['senderIdentityKey'] as String? ?? '',
+      senderEphemeralKey: json['senderEphemeralKey'] as String? ?? '',
+      receiverOneTimePrekeyId: (json['receiverOneTimePrekeyId'] as num?)?.toInt(),
+      isPrekeyMessage: json['isPrekeyMessage'] as bool? ?? false,
+      version: json['version'] as String? ?? 'v1',
     );
   }
 }

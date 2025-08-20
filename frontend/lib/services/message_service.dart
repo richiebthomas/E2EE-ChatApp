@@ -49,7 +49,7 @@ class MessageService extends ChangeNotifier {
     try {
       final messages = await _apiService.getConversation(userId);
       
-      // Decrypt messages in chronological order
+      // Decrypt messages in chronological order (older first) so counters advance consistently
       messages.sort((a, b) => a.createdAt.compareTo(b.createdAt));
       
       final decryptedMessages = <Message>[];
@@ -140,6 +140,7 @@ class MessageService extends ChangeNotifier {
         signedPrekey: bundle.signedPrekey.pubkey,
         signature: bundle.signedPrekey.signature,
         oneTimePrekey: bundle.oneTimePrekey?.pubkey,
+        oneTimePrekeyId: bundle.oneTimePrekey?.keyId,
       );
       
       debugPrint('✅ Signal Protocol session established');

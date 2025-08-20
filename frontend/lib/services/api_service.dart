@@ -30,7 +30,7 @@ class AuthResponse {
 }
 
 class ApiService {
-  static const String baseUrl = 'http://192.168.1.103:3000/api';
+  static const String baseUrl = 'http://192.168.1.105:3000/api';
   String? _authToken;
   User? _currentUser;
 
@@ -173,7 +173,7 @@ class ApiService {
   }
 
   // Upload only additional one-time prekeys
-  Future<void> uploadOneTimePrekeys(List<String> oneTimePrekeys) async {
+  Future<int> uploadOneTimePrekeys(List<String> oneTimePrekeys) async {
     final response = await http.post(
       Uri.parse('$baseUrl/prekeys/otp/bulk'),
       headers: _headers,
@@ -182,7 +182,8 @@ class ApiService {
       }),
     );
 
-    _handleResponse(response);
+    final data = _handleResponse(response);
+    return (data['startKeyId'] as num?)?.toInt() ?? 0;
   }
 
   // Message endpoints

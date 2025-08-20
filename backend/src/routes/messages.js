@@ -112,6 +112,7 @@ router.post('/send', validateMessage, async (req, res) => {
         id: message.id,
         senderId: message.senderId,
         senderUsername: message.sender.username,
+        recipientId: message.recipientId,
         ciphertext: message.ciphertext,
         messageType: message.messageType,
         createdAt: message.createdAt
@@ -184,6 +185,7 @@ router.get('/offline', validateMessageQuery, async (req, res) => {
         id: msg.id,
         senderId: msg.senderId,
         senderUsername: msg.sender.username,
+        recipientId: msg.recipientId,
         ciphertext: msg.ciphertext,
         messageType: msg.messageType,
         createdAt: msg.createdAt

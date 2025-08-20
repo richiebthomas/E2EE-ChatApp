@@ -240,18 +240,21 @@ class AuthService extends ChangeNotifier {
         const newPrekeyCount = 50;
         final newPrekeys = await CryptoService.generateOneTimePrekeys(newPrekeyCount);
 
-        // Store private keys
-        await Future.wait(newPrekeys.map((otp) => 
-          _storageService.saveOneTimePrekeyPrivate(
-            keyId: otp['keyId'],
-            privateKey: otp['privateKey']!,
-          )
-        ));
-
-        // Upload to backend using OTP-only endpoint
-        await _apiService.uploadOneTimePrekeys(
+        // Upload to backend using OTP-only endpoint and record starting key id
+        final startKeyId = await _apiService.uploadOneTimePrekeys(
           newPrekeys.map((otp) => otp['publicKey']! as String).toList(),
         );
+
+        // Store private keys using global key ids assigned by server
+        for (int i = 0; i < newPrekeys.length; i++) {
+          final globalId = startKeyId + i;
+          await _storageService.saveOneTimePrekeyPrivate(
+            keyId: globalId,
+            privateKey: newPrekeys[i]['privateKey']!,
+          );
+        }
+
+        debugPrint('Uploaded ${newPrekeys.length} OTPs, stored with ids [$startKeyId..${startKeyId + newPrekeys.length - 1}]');
 
         debugPrint('Successfully refreshed prekeys');
       }
@@ -292,3 +295,4 @@ class AuthService extends ChangeNotifier {
     }
   }
 }
+

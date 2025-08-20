@@ -6,8 +6,8 @@ class AppConstants {
   static const String appVersion = '1.0.0';
   
   // API Configuration
-  static const String baseUrl = 'http://192.168.1.103:3000/api';
-  static const String socketUrl = 'http://192.168.1.103:3000';
+  static const String baseUrl = 'http://192.168.1.105:3000/api';
+  static const String socketUrl = 'http://192.168.1.105:3000';
   
   // Cryptographic Constants
   static const int prekeyGenerationCount = 50;

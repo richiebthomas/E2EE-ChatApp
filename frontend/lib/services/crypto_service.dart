@@ -103,6 +103,7 @@ class CryptoService {
     required String signedPrekey,
     required String signature,
     String? oneTimePrekey,
+    int? oneTimePrekeyId,
   }) async {
     if (_signalProtocol == null) {
       throw Exception('Signal Protocol not initialized');
@@ -114,6 +115,7 @@ class CryptoService {
       signedPrekey: signedPrekey,
       signature: signature,
       oneTimePrekey: oneTimePrekey,
+      oneTimePrekeyId: oneTimePrekeyId,
     );
   }
 
